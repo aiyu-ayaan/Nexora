@@ -233,7 +233,8 @@ keeps the metadata; blobs never go in a column.
 
 - Node.js 20+
 - pnpm 9
-- Docker Desktop - only for Postgres, Redis and LiveKit in development
+- Docker - Postgres, Redis and LiveKit in development; the whole stack in a
+  deployment (see [Deploy with Docker](#deploy-with-docker))
 
 ## Quick start
 
@@ -252,15 +253,125 @@ Use `pnpm dev:backend`, not `pnpm dev`: the latter also starts the desktop
 renderer on 5173, which `dev:duo` needs for its own Vite. `pnpm dev:desktop`
 runs a single client against a running backend.
 
-Everything in containers instead:
+Default ports in development: gateway `8080`, auth `3001`, server `3003`, chat
+`3004`, presence `3005`, notification `3006`, call `3007`, LiveKit `7880`,
+renderer `5173`, admin panel `5174`.
+
+---
+
+## Deploy with Docker
+
+`infrastructure/docker/docker-compose.yml` runs the whole stack - every
+service, Nginx, the admin panel, Postgres, Redis and LiveKit - in containers.
+Only the gateway and LiveKit publish ports; the data stores publish none.
+
+### 1. Configure
+
+Every command below is run **from the repository root**, which is where Compose
+reads `.env`.
+
+```bash
+cp .env.example .env
+```
+
+The compose file supplies `DATABASE_URL`, `REDIS_URL` and the service ports
+itself, so those entries in `.env` are ignored in this mode. What it does read
+from `.env`:
+
+| Variable | Set it to | Why |
+| --- | --- | --- |
+| `JWT_SECRET` | 48 random bytes, hex | Required; the stack refuses to start without it |
+| `JWT_REFRESH_SECRET` | a *different* 48 random bytes | Required |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | your own pair, not `devkey` | Required; the shipped pair is development-only |
+| `LIVEKIT_URL` | `/livekit` | **Change this.** `.env.example` ships the host-development value `ws://127.0.0.1:7880`, which points every client at its own machine. `/livekit` keeps the deployment on one address |
+| `PUBLIC_API_URL` | the public base URL, e.g. `https://nexora.example.com` | The OAuth callback is built from it |
+| `OAUTH_ALLOWED_REDIRECTS` | `<PUBLIC_API_URL>/admin` | Where a finished OAuth sign-in may return |
+| `CORS_ORIGIN` | your public origin, or leave `*` | Browser clients only; the desktop app is not affected |
+| `GATEWAY_PORT` | `8080`, or `127.0.0.1:8080` | The second form keeps the gateway off the LAN while a host tunnel can still reach it |
+| `SETTINGS_SECRET` | optional, another random value | Seals OAuth client secrets at rest; falls back to `JWT_SECRET` |
+| `POSTGRES_PASSWORD` | a real password | Defaults to `postgres` |
+
+Generate a secret with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"
+```
+
+### 2. Start
 
 ```bash
 docker compose -f infrastructure/docker/docker-compose.yml up -d --build
 ```
 
-Default ports: gateway `8080`, auth `3001`, server `3003`, chat `3004`,
-presence `3005`, notification `3006`, call `3007`, LiveKit `7880`, renderer
-`5173`, admin panel `5174`.
+The one-shot `migrate` container applies the Prisma migrations before any
+service accepts traffic, so there is no separate schema step. Check it came up:
+
+```bash
+docker compose -f infrastructure/docker/docker-compose.yml ps
+curl http://localhost:8080/health
+```
+
+### 3. Create the first administrator
+
+The admin panel has no sign-up. The first administrator is created against the
+database, and the generated password is printed once:
+
+```bash
+docker compose -f infrastructure/docker/docker-compose.yml run --rm \
+  -w /repo/packages/database migrate \
+  ./node_modules/.bin/tsx prisma/create-admin.ts
+```
+
+This reuses the `migrate` container, which already has the schema, the Prisma
+client and database access. It creates:
+
+```
+username  nexoraadmin
+email     admin@nexora.local
+password  printed once by the command above
+```
+
+The account must change that password at first login. Re-running the command
+when the account exists does nothing; add `--reset` at the end of the command
+to issue a new password and revoke every session the old one left behind.
+
+Sign in at `http://localhost:8080/admin` (or `https://nexora.example.com/admin`
+once the tunnel is up) - the panel is served behind the same gateway.
+
+Ordinary user accounts need none of this: they register from the desktop app's
+sign-up screen.
+
+### 4. Open the ports that matter
+
+| Port | Carries | Needed publicly? |
+| --- | --- | --- |
+| `8080/tcp` | Everything: REST, `/ws/chat`, `/ws/presence`, `/ws/remote`, uploads, `/admin`, LiveKit signalling | Yes - or point a Cloudflare Tunnel at it instead |
+| `7881/tcp`, `50000-50019/udp` | WebRTC media to the SFU | Yes, for voice, video, screen share and remote desktop |
+| `5432`, `6379` | Postgres, Redis | No - they publish no ports at all |
+
+A tunnel carries `8080` fine; it cannot carry the media path. Voice and screen
+share need those LiveKit ports reachable, or a TURN relay in front of them.
+
+### 5. Day to day
+
+```bash
+# logs, all services or one
+docker compose -f infrastructure/docker/docker-compose.yml logs -f
+docker compose -f infrastructure/docker/docker-compose.yml logs -f chat-service
+
+# update to a new build (migrations reapply on the way up)
+git pull
+docker compose -f infrastructure/docker/docker-compose.yml up -d --build
+
+# stop, keeping the database and uploaded files
+docker compose -f infrastructure/docker/docker-compose.yml down
+
+# stop and delete them too
+docker compose -f infrastructure/docker/docker-compose.yml down -v
+```
+
+Postgres, Redis and the uploads live in named volumes (`postgres-data`,
+`redis-data`, `upload-data`), so `down` without `-v` keeps everything.
 
 ## Desktop client
 
@@ -286,9 +397,27 @@ a single variable to set:
 VITE_API_URL="https://nexora.example.com"
 ```
 
-Leave it empty for `pnpm dev` - the Vite dev server proxies to the services
-itself, and its own origin is then the gateway. It is read from the repo-root
-`.env`.
+Which URL that is:
+
+| Where the backend runs | Point the desktop app at |
+| --- | --- |
+| `pnpm dev:backend` on this machine | nothing - `pnpm dev` proxies to the services itself |
+| Docker compose on this machine | `http://localhost:8080` (the built-in default) |
+| Docker compose on another machine on the LAN | `http://<its-ip>:8080` |
+| Behind a Cloudflare Tunnel | `https://nexora.example.com` |
+
+The port is `GATEWAY_PORT`, never a service port: `3001`, `3004` and the rest
+are internal to the Docker network and are not what a client talks to.
+
+`VITE_API_URL` is read from the repo-root `.env` and baked in at build time, so
+it only affects a packaged build:
+
+```bash
+VITE_API_URL="https://nexora.example.com" pnpm --filter @nexora/desktop package
+```
+
+`pnpm dev` ignores it deliberately - the Vite dev server proxies to the
+services itself, and its own origin is then the gateway.
 
 It is only the default. **Connect to a self-hosted instance** on the login
 screen (and *Change server* in Settings → My Account) points the window at any
